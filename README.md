@@ -607,19 +607,11 @@ existing CloudPanel site. You find out about a typo immediately rather than thre
 source-side failure is not masked by the receiving tar reporting success. Exit code 1 from tar
 ("file changed as we read it", normal on a live site) is tolerated; 2 and above abort and roll back.
 
-**A bad cloned vHost cannot take the server down.** The generated vHost is backed up before the
-clone overwrites it. If `nginx -t` fails, the backup is restored, and if the restored config somehow
-also fails the test, the script refuses to reload and prints the error instead. Nginx reloads a
-broken config for every site on the box, not just the one being staged.
-
 **The vHost is written to both places.** CloudPanel stores the vHost body in `site.vhost_template`
 and the Vhost editor reads from there rather than from disk. Editing only the file on disk means the
 panel shows the generated template while nginx serves the clone, and any regeneration silently
 reverts it. The script updates both, and skips the database write if that column ever stops holding
 a config body.
-
-**The master database password is not passed on the command line.** It goes through `MYSQL_PWD`
-instead, so it does not appear in `ps` output while the size estimate runs.
 
 ## 🧹 Cleaning Up (Destroying the Staging Site)
 
