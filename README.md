@@ -16,7 +16,11 @@ It automatically:
 
 6. Clones Varnish configuration
 
-7. Asks to issue Let's Encrypt cetificates by listing all the required domains, make sure you've pointed the DNS records before proceeding.
+7. Clones custom Nginx vHost edits, and keeps CloudPanel's own vHost record in sync with the file on disk so the panel's Vhost editor does not show stale config.
+
+8. Asks to issue Let's Encrypt certificates by listing all the required domains. Point the DNS records first.
+
+If any step fails, the script rolls back everything it created: the site, the database, the temporary dump, and the vHost.
 
 ## 🚀 How to Install & Run on Your Server
 
@@ -86,7 +90,7 @@ get_db_estimate() {
         local db_root_pass=$(clpctl db:show:master-credentials | grep 'Password' | awk -F'|' '{print $3}' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
         
         # Query MySQL for combined table sizes in MB using the master credentials
-        local size_mb=$(mysql -h 127.0.0.1 -u root -p"$db_root_pass" -Bse "SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 0) FROM information_schema.tables WHERE table_schema = '$db_name';" 2>/dev/null)
+        local size_mb=$(MYSQL_PWD="$db_root_pass" mysql -h 127.0.0.1 -u root -Bse "SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 0) FROM information_schema.tables WHERE table_schema = '$db_name';" 2>/dev/null)
         
         if [[ -n "$size_mb" && "$size_mb" != "NULL" && "$size_mb" -gt 0 ]]; then
             # DB exports/imports are CPU/SQL bound, assume roughly 15MB/s processing
@@ -111,6 +115,7 @@ STG_DOMAIN=""
 STG_DB_NAME=""
 PROD_DB_NAME=""
 CURRENT_PID=""
+STG_VHOST_BAK=""
 
 cleanup_on_error() {
     local exit_code=$?
@@ -126,6 +131,10 @@ cleanup_on_error() {
         
         if [[ -n "$PROD_DB_NAME" && -f "/tmp/${PROD_DB_NAME}.sql.gz" ]]; then
             rm -f "/tmp/${PROD_DB_NAME}.sql.gz"
+        fi
+        
+        if [[ -n "$STG_VHOST_BAK" && -f "$STG_VHOST_BAK" ]]; then
+            rm -f "$STG_VHOST_BAK"
         fi
         
         if [ "$STG_DB_CREATED" = true ] && [[ -n "$STG_DB_NAME" ]]; then
@@ -175,7 +184,7 @@ execute_with_spinner() {
     printf "\r\033[K" # Clear line
     
     if [ $exit_code -eq 0 ]; then
-        if grep -qi "invalid command\|error\|exception" "$log_file"; then
+        if grep -qiE '^[[:space:]]*(\[ERROR\]|Invalid command|Fatal error|PHP Fatal error|Uncaught [A-Za-z]*Exception)' "$log_file"; then
             printf "\e[31m[x]\e[0m %s\n" "$msg"
             echo -e "\e[31m--- ERROR DETAILS ---\e[0m"
             cat "$log_file"
@@ -337,6 +346,17 @@ if [[ "$STG_DOMAIN" != *"."* ]]; then
     echo -e "  \e[90m↳ Auto-completed to: $STG_DOMAIN\e[0m"
 fi
 
+STG_DOMAIN="${STG_DOMAIN,,}"
+if [[ ! "$STG_DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    echo -e "\e[31m[ERROR] Not a valid domain name: $STG_DOMAIN\e[0m"
+    exit 1
+fi
+
+if [[ -n "$(sqlite3 "$DB_PATH" "SELECT 1 FROM site WHERE domain_name = '$STG_DOMAIN' LIMIT 1;")" ]]; then
+    echo -e "\e[31m[ERROR] A site for $STG_DOMAIN already exists in CloudPanel.\e[0m"
+    exit 1
+fi
+
 CLEAN_DOMAIN=$(echo "$STG_DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-6)
 RND_STR=$(openssl rand -hex 2)
 STG_USER="stg${CLEAN_DOMAIN}${RND_STR}"
@@ -380,10 +400,18 @@ fi
 SRC_DIR="/home/$SRC_USER/htdocs/$PROD_DOMAIN"
 DEST_DIR="/home/$STG_USER/htdocs/$STG_DOMAIN"
 
+if [[ ! -d "$SRC_DIR" ]]; then
+    echo -e "\e[31m[ERROR] Source directory not found: $SRC_DIR\e[0m"
+    exit 1
+fi
+
 FILE_ESTIMATE=$(get_size_estimate "$SRC_DIR")
 echo -e "\e[34m[i]\e[0m File Volume: $FILE_ESTIMATE"
 
-FILE_CMD="tar -C \"$SRC_DIR\" -cf - . | tar -xf - -C \"$DEST_DIR\" && chown -R \"$STG_USER:$STG_USER\" \"$DEST_DIR\""
+# pipefail so a source-side tar failure is not masked by the receiving tar.
+# tar exit 1 means "file changed as we read it", which is normal on a live
+# site, so only 2 and above are treated as fatal.
+FILE_CMD="set -o pipefail; tar -C \"$SRC_DIR\" -cf - . | tar -xf - -C \"$DEST_DIR\"; rc=\$?; if [ \$rc -ge 2 ]; then exit \$rc; fi; chown -R \"$STG_USER:$STG_USER\" \"$DEST_DIR\""
 
 execute_with_spinner "Copying Site Files and Setting Permissions..." "$FILE_CMD"
 
@@ -442,6 +470,10 @@ STG_VHOST="/etc/nginx/sites-enabled/$STG_DOMAIN.conf"
 [[ ! -f "$PROD_VHOST" ]] && PROD_VHOST="/etc/nginx/sites-available/$PROD_DOMAIN.conf" && STG_VHOST="/etc/nginx/sites-available/$STG_DOMAIN.conf"
 
 if [[ -f "$PROD_VHOST" && -f "$STG_VHOST" ]]; then
+    # Keep a copy of the vHost CloudPanel just generated, so a bad clone can be undone
+    STG_VHOST_BAK="$STG_VHOST.clp-stager.bak"
+    cp -a "$STG_VHOST" "$STG_VHOST_BAK"
+
     # Extract the newly generated PHP port for the staging site
     STG_PORT=$(grep "fastcgi_pass" "$STG_VHOST" | awk '{print $2}' | tr -d ';')
 
@@ -459,10 +491,35 @@ if [[ -f "$PROD_VHOST" && -f "$STG_VHOST" ]]; then
     if nginx -t >/dev/null 2>&1; then
         systemctl reload nginx
         echo -e "\e[32m[✓]\e[0m Custom Nginx vHost settings copied successfully."
+
+        # CloudPanel keeps its own copy of the vHost in site.vhost_template and the
+        # Vhost editor reads from there, not from disk. Without this the panel shows
+        # the generated template while nginx serves the clone, and any regeneration
+        # silently reverts the clone. Only sync if the column really holds a config
+        # body, in case a future version stores a template name instead.
+        STORED_VHOST=$(sqlite3 "$DB_PATH" "SELECT substr(vhost_template, 1, 200) FROM site WHERE domain_name = '$STG_DOMAIN' LIMIT 1;")
+        if [[ "$STORED_VHOST" == *"server"*"{"* ]]; then
+            STG_VHOST_BODY=$(sed "s/'/''/g" "$STG_VHOST")
+            sqlite3 "$DB_PATH" "UPDATE site SET vhost_template = '$STG_VHOST_BODY' WHERE domain_name = '$STG_DOMAIN';"
+            echo -e "\e[32m[✓]\e[0m CloudPanel vHost record synced with the file on disk."
+        else
+            echo -e "\e[33m[!]\e[0m CloudPanel does not appear to store the vHost body. Skipped DB sync."
+        fi
+
+        rm -f "$STG_VHOST_BAK"
+        STG_VHOST_BAK=""
     else
-        clpctl site:add:php --domainName="$STG_DOMAIN" --phpVersion="$PHP_VERSION" --vhostTemplate="Generic" --siteUser="$STG_USER" --siteUserPassword="$STG_PASS" >/dev/null 2>&1 || true
-        systemctl reload nginx
-        echo -e "\e[33m[!]\e[0m Copied vHost failed Nginx tests. Reverted to default template safely."
+        # Put back the vHost CloudPanel generated. Never reload a config that fails
+        # its own test: that takes down every site on the box, not just this one.
+        mv -f "$STG_VHOST_BAK" "$STG_VHOST"
+        STG_VHOST_BAK=""
+        if nginx -t >/dev/null 2>&1; then
+            systemctl reload nginx
+            echo -e "\e[33m[!]\e[0m Copied vHost failed Nginx tests. Restored the generated vHost."
+        else
+            echo -e "\e[31m[x]\e[0m Restored vHost also fails nginx -t. NOT reloading. Fix manually:"
+            nginx -t || true
+        fi
     fi
 fi
 
@@ -539,6 +596,30 @@ Whenever you want to spin up a staging site, simply run:
 
 Use your arrow keys to select the production site, type in your staging domain (e.g., `stg.example.com`), and the script will automatically clone the files and database!
 *(Note: Ensure you have pointed your DNS A-Record for your staging domain to your server IP).*
+
+## Notes on behaviour
+
+**The staging domain is validated before anything is created.** A bare prefix like `stg` is expanded
+to `stg.<production domain>` first, then checked against a hostname pattern, then checked for an
+existing CloudPanel site. You find out about a typo immediately rather than three steps in.
+
+**The file copy fails loudly on a partial copy.** The `tar` pipeline runs with `pipefail`, so a
+source-side failure is not masked by the receiving tar reporting success. Exit code 1 from tar
+("file changed as we read it", normal on a live site) is tolerated; 2 and above abort and roll back.
+
+**A bad cloned vHost cannot take the server down.** The generated vHost is backed up before the
+clone overwrites it. If `nginx -t` fails, the backup is restored, and if the restored config somehow
+also fails the test, the script refuses to reload and prints the error instead. Nginx reloads a
+broken config for every site on the box, not just the one being staged.
+
+**The vHost is written to both places.** CloudPanel stores the vHost body in `site.vhost_template`
+and the Vhost editor reads from there rather than from disk. Editing only the file on disk means the
+panel shows the generated template while nginx serves the clone, and any regeneration silently
+reverts it. The script updates both, and skips the database write if that column ever stops holding
+a config body.
+
+**The master database password is not passed on the command line.** It goes through `MYSQL_PWD`
+instead, so it does not appear in `ps` output while the size estimate runs.
 
 ## 🧹 Cleaning Up (Destroying the Staging Site)
 
