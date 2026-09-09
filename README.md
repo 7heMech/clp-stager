@@ -1,3 +1,5 @@
+## Depreaciated in favor of https://github.com/7hemech/cloudpanel-addons
+
 # CloudPanel Stager (`clp-stager`)
 
 A lightweight, interactive Bash script for CloudPanel that clones a production website into a fully functional staging environment in seconds.
